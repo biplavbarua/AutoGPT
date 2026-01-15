@@ -38,29 +38,53 @@ settings = Settings()
 #   maxmemory 2gb                   # Set memory limit (adjust based on your needs)
 #   save ""                         # Disable persistence if using Redis purely for caching
 
-# Create a dedicated Redis connection pool for caching (binary mode for pickle)
-_cache_pool: ConnectionPool | None = None
+class _RedisCache:
+    """
+    Lazy Redis connection manager for shared cache operations.
+    Connection is only established when first accessed, allowing services
+    that only use in-memory caching to work without Redis configuration.
+    """
+
+    _instance: "_RedisCache | None" = None
+    _pool: ConnectionPool | None = None
+    _client: Redis | None = None
+
+    def __new__(cls) -> "_RedisCache":
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    @property
+    def pool(self) -> ConnectionPool:
+        if self._pool is None:
+            self._pool = ConnectionPool(
+                host=settings.config.redis_host,
+                port=settings.config.redis_port,
+                password=settings.config.redis_password or None,
+                decode_responses=False,  # Binary mode for pickle
+                max_connections=50,
+                socket_keepalive=True,
+                socket_connect_timeout=5,
+                retry_on_timeout=True,
+            )
+        return self._pool
+
+    @property
+    def client(self) -> Redis:
+        if self._client is None:
+            self._client = self._connect()
+        return self._client
+
+    @conn_retry("Redis", "Acquiring cache connection")
+    def _connect(self) -> Redis:
+        r = Redis(connection_pool=self.pool)
+        r.ping()  # Verify connection
+        return r
 
 
-@conn_retry("Redis", "Acquiring cache connection pool")
-def _get_cache_pool() -> ConnectionPool:
-    """Get or create a connection pool for cache operations."""
-    global _cache_pool
-    if _cache_pool is None:
-        _cache_pool = ConnectionPool(
-            host=settings.config.redis_host,
-            port=settings.config.redis_port,
-            password=settings.config.redis_password or None,
-            decode_responses=False,  # Binary mode for pickle
-            max_connections=50,
-            socket_keepalive=True,
-            socket_connect_timeout=5,
-            retry_on_timeout=True,
-        )
-    return _cache_pool
-
-
-redis = Redis(connection_pool=_get_cache_pool())
+def _get_redis() -> Redis:
+    """Get the lazily-initialized Redis client for shared cache operations."""
+    return _RedisCache().client
 
 
 @dataclass
@@ -179,9 +203,9 @@ def cached(
             try:
                 if refresh_ttl_on_get:
                     # Use GETEX to get value and refresh expiry atomically
-                    cached_bytes = redis.getex(redis_key, ex=ttl_seconds)
+                    cached_bytes = _get_redis().getex(redis_key, ex=ttl_seconds)
                 else:
-                    cached_bytes = redis.get(redis_key)
+                    cached_bytes = _get_redis().get(redis_key)
 
                 if cached_bytes and isinstance(cached_bytes, bytes):
                     return pickle.loads(cached_bytes)
@@ -195,7 +219,7 @@ def cached(
             """Set value in Redis with TTL."""
             try:
                 pickled_value = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
-                redis.setex(redis_key, ttl_seconds, pickled_value)
+                _get_redis().setex(redis_key, ttl_seconds, pickled_value)
             except Exception as e:
                 logger.error(
                     f"Redis error storing cache for {target_func.__name__}: {e}"
@@ -333,14 +357,14 @@ def cached(
                 if pattern:
                     # Clear entries matching pattern
                     keys = list(
-                        redis.scan_iter(f"cache:{target_func.__name__}:{pattern}")
+                        _get_redis().scan_iter(f"cache:{target_func.__name__}:{pattern}")
                     )
                 else:
                     # Clear all cache keys
-                    keys = list(redis.scan_iter(f"cache:{target_func.__name__}:*"))
+                    keys = list(_get_redis().scan_iter(f"cache:{target_func.__name__}:*"))
 
                 if keys:
-                    pipeline = redis.pipeline()
+                    pipeline = _get_redis().pipeline()
                     for key in keys:
                         pipeline.delete(key)
                     pipeline.execute()
@@ -355,7 +379,7 @@ def cached(
 
         def cache_info() -> dict[str, int | None]:
             if shared_cache:
-                cache_keys = list(redis.scan_iter(f"cache:{target_func.__name__}:*"))
+                cache_keys = list(_get_redis().scan_iter(f"cache:{target_func.__name__}:*"))
                 return {
                     "size": len(cache_keys),
                     "maxsize": None,  # Redis manages its own size
@@ -373,8 +397,8 @@ def cached(
             key = _make_hashable_key(args, kwargs)
             if shared_cache:
                 redis_key = _make_redis_key(key, target_func.__name__)
-                if redis.exists(redis_key):
-                    redis.delete(redis_key)
+                if _get_redis().exists(redis_key):
+                    _get_redis().delete(redis_key)
                     return True
                 return False
             else:
